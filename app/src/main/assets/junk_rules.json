@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "rules": [
+    { "id": "dir_cache", "kind": "DIR_NAME", "match": "cache", "risk": "SAFE", "checked": true, "desc": "缓存目录" },
+    { "id": "dir_caches", "kind": "DIR_NAME", "match": "caches", "risk": "SAFE", "checked": true, "desc": "缓存目录" },
+    { "id": "dir_temp", "kind": "DIR_NAME", "match": "temp", "risk": "SAFE", "checked": true, "desc": "临时目录" },
+    { "id": "dir_tmp", "kind": "DIR_NAME", "match": "tmp", "risk": "SAFE", "checked": true, "desc": "临时目录" },
+    { "id": "thumbs", "kind": "PATH_CONTAINS", "match": "/.thumbnails", "risk": "SAFE", "checked": true, "desc": "缩略图缓存" },
+    { "id": "wechat_webcache", "kind": "PATH_CONTAINS", "match": "/MicroMsg/WeiXinXwebcache", "risk": "SAFE", "checked": true, "desc": "微信网页缓存" },
+    { "id": "wechat_temp", "kind": "PATH_CONTAINS", "match": "/MicroMsg/temp", "risk": "SAFE", "checked": true, "desc": "微信临时目录" },
+    { "id": "ads_dir", "kind": "PATH_CONTAINS", "match": "/ads/", "risk": "CAUTION", "checked": false, "desc": "疑似广告目录" },
+    { "id": "ext_tmp", "kind": "EXTENSION", "match": "tmp", "risk": "SAFE", "checked": true, "desc": "临时文件" },
+    { "id": "ext_log", "kind": "EXTENSION", "match": "log", "risk": "CAUTION", "checked": false, "desc": "日志文件" },
+    { "id": "ext_apk", "kind": "EXTENSION", "match": "apk", "risk": "CAUTION", "checked": true, "desc": "安装包(已安装的可删)" },
+    { "id": "ext_dmp", "kind": "EXTENSION", "match": "dmp", "risk": "SAFE", "checked": true, "desc": "崩溃转储" },
+    { "id": "ext_old_pic_cache", "kind": "EXTENSION", "match": "pic", "risk": "CAUTION", "checked": false, "desc": "图片缓存文件" }
+  ]
+}
