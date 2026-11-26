@@ -131,7 +131,7 @@ fun SettingsScreen(vm: SettingsViewModel = viewModel()) {
                     Spacer(Modifier.height(6.dp))
                     Text("· 文件内容绝不上传, 全部本地处理\n" +
                         "· 不做「一键加速杀后台」; 结束进程通过系统页面完成\n" +
-                        "· 清理=软删除进回收站, 7 天内可还原\n" + "· v1.0.0 开源版",
+                        "· 清理=软删除进回收站, 7 天内可还原\n" + "· v1.1.0 开源版",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }

@@ -3,6 +3,7 @@ package top.modelx.droidcare.ui
 import android.app.Application
 import android.content.Intent
 import android.widget.Toast
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -32,6 +33,7 @@ import top.modelx.droidcare.core.Perm
 import top.modelx.droidcare.process.ProcRepo
 import top.modelx.droidcare.process.RunningProc
 import top.modelx.droidcare.process.StopGuide
+import top.modelx.droidcare.process.TaskInfo
 import top.modelx.droidcare.process.UsageRepo
 import top.modelx.droidcare.shizuku.ShizukuRepo
 
@@ -44,8 +46,15 @@ class RunViewModel(app: Application) : AndroidViewModel(app) {
     var geek by mutableStateOf(false)
     var shizGranted by mutableStateOf(false)
     var hasUsage by mutableStateOf(Perm.hasUsageAccess(app))
+    var tasks by mutableStateOf<List<TaskInfo>>(emptyList())
     private val labels = HashMap<String, String>()
     private val procRepo = ProcRepo(app)
+    private var lastTicks: Map<Int, Long>? = null
+    private var lastTs = 0L
+    private var netCache: Map<String, LongArray> = emptyMap()
+    private var netTs = 0L
+    private data class Meta(val systemApp: Boolean, val internet: Boolean, val suspended: Boolean, val suspicious: Boolean)
+    private val metaCache = HashMap<String, Meta>()
 
     init {
         refresh()
@@ -75,7 +84,34 @@ class RunViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             val all = try { AppRepo(getApplication()).load(withStats = false) } catch (e: Exception) { emptyList() }
             disabledApps = all.filter { !it.enabled }
+            metaCache.clear()
         }
+    }
+
+    /** 包元信息: 系统应用/有网络权限/已停用/疑似广告组件 */
+    private fun metaOf(pkg: String): Meta = metaCache.getOrPut(pkg) {
+        var sys = false
+        var susp = false
+        try {
+            val pm = getApplication<Application>().packageManager
+            val ai = pm.getApplicationInfo(pkg, 0)
+            sys = (ai.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
+            susp = !ai.enabled
+        } catch (e: Exception) { /* ignore */ }
+        val internet = try {
+            getApplication<Application>().packageManager
+                .checkPermission(android.Manifest.permission.INTERNET, pkg) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        } catch (e: Exception) { false }
+        val sus = sys && internet && TaskInfo.suspect(pkg, label(pkg))
+        Meta(sys, internet, susp, sus)
+    }
+
+    /** 结束单个进程(shell kill -9) */
+    fun killPid(pid: Int): Boolean {
+        val ok = ShizukuRepo.ready && ShizukuRepo.killPid(pid)
+        if (ok) refreshNow()
+        return ok
     }
 
     /** 真正停止(极客模式); 返回 false 表示不可用, 由 UI 引导系统页面 */
@@ -89,6 +125,7 @@ class RunViewModel(app: Application) : AndroidViewModel(app) {
     fun setEnabled(pkg: String, enabled: Boolean): Boolean {
         val ok = (ShizukuRepo.ready && ShizukuRepo.setEnabled(pkg, enabled))
             || procRepo.trySetEnabled(pkg, enabled)
+        if (ok && !enabled && ShizukuRepo.ready) ShizukuRepo.forceStop(pkg)
         if (ok) { loadDisabled(); refreshNow() }
         return ok
     }
@@ -115,8 +152,42 @@ class RunViewModel(app: Application) : AndroidViewModel(app) {
         if (!hasUsage) hasUsage = Perm.hasUsageAccess(getApplication())
         viewModelScope.launch(Dispatchers.IO) {
             geek = ShizukuRepo.ready
-            procs = if (ShizukuRepo.ready) ShizukuRepo.procs(impMap())
-                    else procRepo.runningProcs()
+            if (ShizukuRepo.ready) {
+                val now = System.currentTimeMillis()
+                if (now - netTs > 20000 || netCache.isEmpty()) {
+                    netCache = ShizukuRepo.netByPkg()
+                    netTs = now
+                }
+                val rows = ShizukuRepo.procRows().filter { !it.third.contains('/') }
+                val rss = ShizukuRepo.rssMap()
+                val ticks = ShizukuRepo.ticksMap()
+                val imp = impMap()
+                val prev = lastTicks
+                val dt = now - lastTs
+                tasks = rows.map { (pid, user, name) ->
+                    val pkg = name.substringBefore(':')
+                    val meta = metaOf(pkg)
+                    val cpu = if (prev != null && ticks != null && dt in 500..15000) {
+                        val d = (ticks[pid] ?: 0L) - (prev[pid] ?: 0L)
+                        if (d < 0) 0.0 else d * 1000.0 / dt
+                    } else -1.0
+                    val net = netCache[pkg]
+                    TaskInfo(pid, pkg, name, user, rss[pid] ?: 0L, cpu,
+                        net?.get(1) ?: -1L, net?.get(0) ?: -1L,
+                        imp[pid] ?: 300, meta.systemApp, meta.internet,
+                        meta.suspicious, meta.suspended)
+                }
+                if (ticks != null) { lastTicks = ticks; lastTs = now }
+                procs = ShizukuRepo.procs(imp)
+            } else {
+                val ps = procRepo.runningProcs()
+                procs = ps
+                tasks = ps.map {
+                    val meta = metaOf(it.pkg)
+                    TaskInfo(it.pid, it.pkg, it.procName, "", it.rssBytes, -1.0, -1L, -1L,
+                        it.importance, meta.systemApp, meta.internet, meta.suspicious, meta.suspended)
+                }
+            }
         }
         if (hasUsage && usage.isEmpty()) {
             viewModelScope.launch(Dispatchers.IO) {
@@ -132,6 +203,7 @@ fun RunScreen(vm: RunViewModel = viewModel()) {
     val ctx = LocalContext.current
     var stopTarget by remember { mutableStateOf<String?>(null) }
     var toggleTarget by remember { mutableStateOf<Pair<String, Boolean>?>(null) } // pkg, wantEnable
+    var detailPid by remember { mutableStateOf<Int?>(null) }
     // 从系统页面(强行停止/停用/启用)返回后立即刷新
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -145,7 +217,7 @@ fun RunScreen(vm: RunViewModel = viewModel()) {
     LaunchedEffect(Unit) { vm.refreshNow() }
 
     Column(Modifier.fillMaxSize()) {
-        ScreenHeader("运行状态", "内存/CPU 实况 + 运行中的服务")
+        ScreenHeader("任务管理", "进程资源占用 · 结束/停用应用与服务")
         SectionCard {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("内存", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
@@ -175,12 +247,26 @@ fun RunScreen(vm: RunViewModel = viewModel()) {
             }
         }
 
-        // ---- 当前运行的服务 ----
-        val procs = vm.procs
-        val memVisible = procs.any { it.rssBytes > 0 && it.pkg != Perm.currentPkg }
+        // ---- 任务列表 ----
+        var taskSort by remember { mutableStateOf("mem") }
+        var taskFilter by remember { mutableStateOf("all") }
+        val susCount = vm.tasks.count { it.suspicious }
+        val shown = remember(vm.tasks, taskSort, taskFilter) {
+            val f = when (taskFilter) {
+                "third" -> vm.tasks.filter { !it.systemApp }
+                "system" -> vm.tasks.filter { it.systemApp }
+                "sus" -> vm.tasks.filter { it.suspicious }
+                else -> vm.tasks
+            }
+            when (taskSort) {
+                "cpu" -> f.sortedByDescending { it.cpuPct }
+                "net" -> f.sortedByDescending { it.txBytes }
+                else -> f.sortedByDescending { it.rssBytes }
+            }
+        }
         SectionCard {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("当前运行的服务", style = MaterialTheme.typography.titleSmall,
+                Text("运行中的任务 (${vm.tasks.size})", style = MaterialTheme.typography.titleSmall,
                     modifier = Modifier.weight(1f))
                 if (vm.geek) Badge("极客模式", MaterialTheme.colorScheme.primary)
                 TextButton(onClick = {
@@ -191,8 +277,8 @@ fun RunScreen(vm: RunViewModel = viewModel()) {
                 }) { Text("系统面板") }
             }
             Text(when {
-                vm.geek -> "极客模式: 全部进程+真实内存(按内存排序), 「停止/停用」立即生效。"
-                else -> "按内存占用排序。点右侧按钮可停用(引导)。标准 Android 8+ 限制第三方读取其它应用进程/内存; 安装并启动 Shizuku 可开启极客模式。"
+                vm.geek -> "CPU/内存/流量每 3 秒刷新。点任务行可结束进程/停止/停用。「疑似」= 预装+有网络权限+广告/推送类包名或名称, 仅供参考。"
+                else -> "标准 Android 8+ 限制第三方读取其它应用进程; 安装并启动 Shizuku 可查看全部进程与真实占用, 并直接结束/停用。"
             },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -212,47 +298,60 @@ fun RunScreen(vm: RunViewModel = viewModel()) {
                     }
                 }
             }
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                FilterChip(taskFilter == "all", { taskFilter = "all" }, { Text("全部") })
+                FilterChip(taskFilter == "third", { taskFilter = "third" }, { Text("第三方") })
+                FilterChip(taskFilter == "system", { taskFilter = "system" }, { Text("系统") })
+                FilterChip(taskFilter == "sus", { taskFilter = "sus" },
+                    { Text(if (susCount > 0) "疑似 $susCount" else "疑似") })
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                FilterChip(taskSort == "mem", { taskSort = "mem" }, { Text("按内存") })
+                FilterChip(taskSort == "cpu", { taskSort = "cpu" }, { Text("按 CPU") })
+                FilterChip(taskSort == "net", { taskSort = "net" }, { Text("按上行") })
+            }
         }
-        if (procs.isNotEmpty()) {
-            LazyColumn(Modifier.weight(1.4f)) {
-                items(procs, key = { "${it.pkg}:${it.pid}" }) { p ->
-                    Row(
-                        Modifier.fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(vm.label(p.pkg), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Spacer(Modifier.width(6.dp))
-                                Badge(p.importanceLabel, MaterialTheme.colorScheme.outline)
+        LazyColumn(Modifier.weight(1.4f)) {
+            items(shown, key = { "${it.pkg}:${it.pid}" }) { t ->
+                Row(
+                    Modifier.fillMaxWidth()
+                        .clickable { if (t.pkg != Perm.currentPkg) detailPid = t.pid }
+                        .padding(horizontal = 16.dp, vertical = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(vm.label(t.pkg), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Spacer(Modifier.width(6.dp))
+                            Badge(t.importanceLabel, MaterialTheme.colorScheme.outline)
+                            if (t.suspicious) {
+                                Spacer(Modifier.width(4.dp))
+                                Badge("疑似", Color(0xFFC62828))
                             }
-                            Text(p.procName, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            if (t.suspended) {
+                                Spacer(Modifier.width(4.dp))
+                                Badge("已停用", MaterialTheme.colorScheme.tertiary)
+                            }
                         }
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            if (p.rssBytes > 0) Format.bytes(p.rssBytes) else "-",
+                        Text(t.procName + " · " + t.user,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Column(horizontalAlignment = Alignment.End) {
+                        Text(String.format("%s%s", if (t.cpuPct >= 0) String.format("CPU %.1f%%  ", t.cpuPct) else "",
+                            if (t.rssBytes > 0) Format.bytes(t.rssBytes) else "-"),
                             style = MaterialTheme.typography.bodySmall)
-                        Spacer(Modifier.width(8.dp))
-                        if (p.pkg == Perm.currentPkg) {
-                            Text("本应用", style = MaterialTheme.typography.labelSmall,
+                        if (t.txBytes >= 0) {
+                            Text(String.format("↑%s ↓%s", Format.bytes(t.txBytes), Format.bytes(t.rxBytes)),
+                                style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        } else {
-                            if (vm.geek) {
-                                TextButton(onClick = {
-                                    if (ShizukuRepo.forceStop(p.pkg)) {
-                                        Toast.makeText(ctx, "已停止 " + vm.label(p.pkg),
-                                            Toast.LENGTH_SHORT).show()
-                                    }
-                                }) { Text("停止") }
-                            }
-                            TextButton(onClick = { toggleTarget = p.pkg to false }) { Text("停用") }
                         }
                     }
-                    HorizontalDivider()
                 }
+                HorizontalDivider()
             }
         }
 
@@ -289,7 +388,7 @@ fun RunScreen(vm: RunViewModel = viewModel()) {
                 }) { Text("去授权") }
             } else {
                 Spacer(Modifier.height(4.dp))
-                Text("点「停止」跳转系统页面执行强行停止; 点「停用」在系统页面禁用应用。",
+                Text("上表「运行中的任务」可直接结束/停用(需极客模式); 此处的停止在未授权时会引导系统页面。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
@@ -361,6 +460,83 @@ fun RunScreen(vm: RunViewModel = viewModel()) {
             },
             dismissButton = { TextButton(onClick = { stopTarget = null }) { Text("取消") } },
         )
+    }
+
+    // ---- 任务详情弹层 ----
+    detailPid?.let { pid ->
+        val t = vm.tasks.firstOrNull { it.pid == pid }
+        ModalBottomSheet(onDismissRequest = { detailPid = null }) {
+            Column(Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
+                if (t == null) {
+                    Text("该进程已退出", style = MaterialTheme.typography.bodyMedium)
+                    Spacer(Modifier.height(24.dp))
+                    return@Column
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(vm.label(t.pkg), style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (t.systemApp) Badge("系统应用", MaterialTheme.colorScheme.tertiary)
+                    if (t.suspicious) {
+                        Spacer(Modifier.width(4.dp))
+                        Badge("疑似广告/推送", Color(0xFFC62828))
+                    }
+                }
+                Spacer(Modifier.height(2.dp))
+                Text(t.procName, style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(10.dp))
+                Text(String.format("PID %d · %s · %s", t.pid, t.user, t.importanceLabel),
+                    style = MaterialTheme.typography.bodyMedium)
+                Text(String.format("内存 %s · CPU %s",
+                    if (t.rssBytes > 0) Format.bytes(t.rssBytes) else "-",
+                    if (t.cpuPct >= 0) String.format("%.1f%%", t.cpuPct) else "-"),
+                    style = MaterialTheme.typography.bodyMedium)
+                if (t.txBytes >= 0) {
+                    Text(String.format("开机以来网络: 上行 %s / 下行 %s%s", Format.bytes(t.txBytes),
+                        Format.bytes(t.rxBytes), if (t.hasInternet) "" else " (无网络权限)"),
+                        style = MaterialTheme.typography.bodyMedium)
+                }
+                if (t.suspicious) {
+                    Spacer(Modifier.height(8.dp))
+                    Text("预装应用且带网络权限, 包名/名称命中广告、推送、遥测类特征。停用前建议先查一下该包用途; 停用后如需恢复可在此启用。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFFE65100))
+                }
+                Spacer(Modifier.height(14.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = {
+                        if (ShizukuRepo.forceStop(t.pkg)) {
+                            Toast.makeText(ctx, "已停止 " + vm.label(t.pkg), Toast.LENGTH_SHORT).show()
+                            detailPid = null
+                        } else {
+                            Toast.makeText(ctx, "停止失败(可能已退出或需重新授权)", Toast.LENGTH_SHORT).show()
+                        }
+                    }) { Text("停止应用") }
+                    OutlinedButton(onClick = {
+                        if (vm.killPid(pid)) {
+                            Toast.makeText(ctx, "已结束进程 $pid", Toast.LENGTH_SHORT).show()
+                            detailPid = null
+                        } else {
+                            Toast.makeText(ctx, "结束失败(需极客模式)", Toast.LENGTH_SHORT).show()
+                        }
+                    }) { Text("结束进程") }
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = {
+                        detailPid = null
+                        toggleTarget = t.pkg to t.suspended
+                    }) { Text(if (t.suspended) "启用应用" else "停用应用") }
+                    OutlinedButton(onClick = {
+                        try {
+                            ctx.startActivity(Perm.appDetailsIntent(t.pkg)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        } catch (e: Exception) { /* ignore */ }
+                    }) { Text("应用信息") }
+                }
+                Spacer(Modifier.height(24.dp))
+            }
+        }
     }
 
     toggleTarget?.let { (pkg, wantEnable) ->
